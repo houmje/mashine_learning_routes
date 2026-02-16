@@ -1,0 +1,405 @@
+Структура документа
+Table
+Copy
+Раздел	Содержание
+1. Общая архитектура	Как связаны блоки А.1–А.5
+2. А.1 — Загрузка данных	Критерий: дедупликация, форматы, карты
+3. А.2 — Структурирование	Критерий: 30-сек интервалы, производные признаки
+4. А.3 — Предобработка	Критерий: отбор признаков, очистка
+5. А.4 — Анализ распределений	Критерий: нормальность, трансформации
+6. А.5 — Расширение данных	Критерий: погода, аугментация
+7. Чек-лист перед защитой	Что проверить в БД
+1. ОБЩАЯ АРХИТЕКТУРА
+plain
+Copy
+┌─────────────────────────────────────────────────────────┐
+│  ИСТОЧНИКИ ДАННЫХ                                       │
+│  • vehicles.csv (справочник ТС)                         │
+│  • weather.csv (температура по датам)                   │
+│  • routes.csv + routes_full.json (маршруты и геометрия) │
+│  • telematics_full.csv (сырые GPS-треки)               │
+│  • map_data.geojson (дороги и POI)                     │
+└─────────────────────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────┐
+│  А.1 ЗАГРУЗКА В БД (SQLite)                            │
+│  • upsert_df_to_sql() — дедупликация по ключам          │
+│  • Статичные карты через Yandex Static Maps API         │
+│  • Повторный запуск = обновление, не дублирование      │
+└─────────────────────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────┐
+│  А.2 СТРУКТУРИРОВАНИЕ (30-сек интервалы)                │
+│  • resample('30S') — равномерная сетка времени          │
+│  • Ускорение, расход kWh/100km, стиль вождения          │
+│  • Привязка температуры по дате                         │
+└─────────────────────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────┐
+│  А.3 ПРЕДОБРАБОТКА                                      │
+│  • Permutation importance (Random Forest)                │
+│  • Корреляционный анализ                               │
+│  • Очистка аномалий (диапазоны, пропуски)              │
+└─────────────────────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────┐
+│  А.4 АНАЛИЗ РАСПРЕДЕЛЕНИЙ                               │
+│  • Гистограммы + KDE                                    │
+│  • Q-Q plots + тест Шапиро-Уилка                       │
+│  • Выводы о логарифмировании/стандартизации            │
+└─────────────────────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────┐
+│  А.5 РАСШИРЕНИЕ И АУГМЕНТАЦИЯ                          │
+│  • Расчёт расстояний (haversine)                        │
+│  • Синтетические поездки с физической моделью         │
+│  • Варьирование скорости и температуры                 │
+└─────────────────────────────────────────────────────────┘
+2. А.1 — ЗАГРУЗКА И ПЕРВИЧНАЯ ОБРАБОТКА
+🔑 Ключевой критерий: «При повторном запуске модуль должен обновлять базу, избегая дублирования записей»
+Реализация: функция upsert_df_to_sql()
+Python
+Copy
+def upsert_df_to_sql(df, table_name, conn, key_columns, chunksize=5000):
+    """
+    UPSERT: UPDATE существующих записей, INSERT новых.
+
+    key_columns — составной ключ для проверки уникальности
+    (например: ['vehicle_id'] или ['vehicle_id', 'timestamp'])
+    """
+    # 1. Получаем существующие ключи из БД
+    cursor.execute(f"SELECT {key_str} FROM {table_name}")
+    existing_keys = set(cursor.fetchall())
+
+    # 2. Разделяем на новые и существующие
+    df_new = df[~df['_key'].isin(existing_keys)]      # INSERT
+    df_existing = df[df['_key'].isin(existing_keys)]  # UPDATE
+
+    # 3. Для справочников (vehicles, weather, routes) — обновляем
+    #    Для телематики — только вставка (данные неизменны)
+Проверка в БД:
+sql
+Copy
+-- Должно быть 0 дубликатов
+SELECT vehicle_id, timestamp, COUNT(*)
+FROM telematics
+GROUP BY vehicle_id, timestamp
+HAVING COUNT(*) > 1;
+🔑 Ключевой критерий: «Получены карты местности с наложенными маршрутами»
+Реализация: Yandex Static Maps API
+Python
+Copy
+# Параметры запроса
+params = {
+    "l": "map",                    # Тип карты
+    "ll": f"{center_lon},{center_lat}",  # Центр
+    "spn": f"{span_lon},{span_lat}",     # Масштаб
+    "size": "650,450",             # Размер изображения
+    "pl": polyline_str,            # Линия маршрута (polyline)
+    "pt": f"{start_pt}~{end_pt}",  # Маркеры начала и конца
+    "apikey": YANDEX_API_KEY
+}
+
+# Сохранение
+response = requests.get(base_url, params=params)
+with open(full_path, 'wb') as f:
+    f.write(response.content)
+Результат: ./maps/route_{route_id}.png — статичное изображение с треком.
+3. А.2 — ФОРМИРОВАНИЕ СТРУКТУРИРОВАННОГО НАБОРА
+🔑 Ключевой критерий: «Для каждого временного отрезка (30 секунд)»
+Реализация: ресемплинг временных рядов
+Python
+Copy
+# Сортировка обязательна!
+df_tel = df_tel.sort_values(by=['vehicle_id', 'route_id', 'timestamp'])
+
+# Группировка по поездкам (нельзя смешивать разные машины!)
+grouped = df_tel.groupby(['vehicle_id', 'route_id'])
+
+for (vid, rid), group in grouped:
+    group = group.set_index('timestamp')  # DatetimeIndex
+
+    # Ресемплинг 30 секунд
+    resampled = group.resample('30S').mean()  # Усреднение в бине
+
+    # Интерполяция пропусков (если в 30с не было данных)
+    resampled = resampled.interpolate(method='linear')
+Что происходит:
+Table
+Copy
+Исходные данные	После resample('30S')
+10:00:05, 10:00:12, 10:00:18	10:00:00 (среднее 3 точек)
+10:00:31, 10:00:45	10:00:30 (среднее 2 точек)
+Пропуск 10:01:00–10:01:25	10:01:00 (интерполяция)
+🔑 Ключевой критерий: «Рассчитаны производные признаки: ускорение, расход на км, стиль вождения»
+Ускорение (м/с²):
+Python
+Copy
+# Сдвиг на 1 шаг внутри группы (машины)
+df_tel['prev_speed'] = df_tel.groupby('vehicle_id')['speed_kmh'].shift(1)
+
+# Перевод км/ч в м/с: делим на 3.6
+df_tel['acceleration'] = ((df_tel['speed_kmh'] - df_tel['prev_speed']) / 3.6) / time_diff_sec
+Расход энергии (kWh/100km):
+Python
+Copy
+# ΔSOC = падение заряда в процентах
+df_tel['delta_soc'] = df_tel['prev_soc'] - df_tel['battery_soc_percent']
+df_tel['delta_soc'] = df_tel['delta_soc'].clip(lower=0)  # Зарядка = 0
+
+# Энергия = % * ёмкость_батареи
+df_tel['energy_used_kwh'] = (df_tel['delta_soc'] / 100) * df_tel['battery_capacity_kwh']
+
+# Расход на 100 км
+df_tel['consumption_kwh_per_100km'] = (df_tel['energy_used_kwh'] / km_driven) * 100
+Стиль вождения:
+Python
+Copy
+def get_driving_style(acc):
+    if abs(acc) > 2.5:      # Резкое ускорение/торможение
+        return "Aggressive"
+    elif abs(acc) < 0.5:    # Почти равномерно
+        return "Cruising"
+    else:
+        return "Normal"     # Средний режим
+🔑 Ключевой критерий: «Набор данных содержит все указанные атрибуты»
+Table
+Copy
+Атрибут	Колонка	Проверка
+vehicle_id	vehicle_id	✅
+timestamp	timestamp	✅
+координаты	latitude, longitude	✅
+скорость	speed_kmh	✅
+SOC	battery_soc_percent	✅
+расход	consumption_kwh_per_100km	✅
+одометр	odometer	✅
+тип дороги	road_type	⚠️ Проверить в df_final!
+температура	avg_temperature_c	✅
+Проверка перед сохранением:
+Python
+Copy
+required = ['vehicle_id', 'timestamp', 'latitude', 'longitude',
+            'speed_kmh', 'battery_soc_percent', 'consumption_kwh_per_100km',
+            'odometer', 'road_type', 'avg_temperature_c']
+
+missing = [c for c in required if c not in df_final.columns]
+assert len(missing) == 0, f"Отсутствуют: {missing}"
+4. А.3 — ПРЕДОБРАБОТКА И ВЫДЕЛЕНИЕ ЗНАЧИМЫХ АТРИБУТОВ
+🔑 Ключевой критерий: «Выделены значимые атрибуты с помощью корреляционного анализа, SHAP или permutation importance»
+Реализация: Permutation Importance (рекомендован как альтернатива SHAP)
+Python
+Copy
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.inspection import permutation_importance
+
+# Модель: Random Forest для предсказания расхода
+rf = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1)
+rf.fit(X, y)  # X — признаки, y — consumption_kwh_per_100km
+
+# Permutation importance: перемешиваем значения признака, смотрим падение качества
+perm_importance = permutation_importance(rf, X, y, n_repeats=5, n_jobs=-1)
+
+# Результат: чем выше importance, тем важнее признак
+feature_imp = pd.DataFrame({
+    'Feature': features,
+    'Importance': perm_importance.importances_mean
+}).sort_values(by='Importance', ascending=False)
+Топ признаков обычно:
+Table
+Copy
+Признак	Importance	Физический смысл
+speed_squared	~0.35	Аэродинамическое сопротивление ~ v²
+avg_temperature_c	~0.25	Холод/жара влияют на батарею
+abs_acceleration	~0.15	Резкие маневры = больше расход
+battery_soc_percent	~0.10	Нелинейность батареи на низком SOC
+Корреляционный анализ (дополнительно):
+Python
+Copy
+corr_matrix = df[features + ['consumption_kwh_per_100km']].corr()
+# Проверка мультиколлинеарности: |r| > 0.8 между признаками
+🔑 Ключевой критерий: «Очистка данных от аномалий и пропусков»
+Реализация:
+Python
+Copy
+# 1. Диапазонные фильтры (физические ограничения)
+df = df[(df['speed_kmh'] >= 0) & (df['speed_kmh'] < 350)]      # Скорость
+df = df[(df['consumption_kwh_per_100km'] >= 0) &
+        (df['consumption_kwh_per_100km'] <= 100)]              # Расход
+df = df[(df['avg_temperature_c'] >= -50) &
+        (df['avg_temperature_c'] <= 60)]                       # Температура
+
+# 2. Заполнение пропусков
+df['avg_temperature_c'].fillna(df['avg_temperature_c'].mean(), inplace=True)
+df['road_type'].fillna('Unknown', inplace=True)
+
+# 3. Удаление критичных пропусков (целевая переменная)
+df.dropna(subset=['consumption_kwh_per_100km'], inplace=True)
+5. А.4 — ОПИСАНИЕ И АНАЛИЗ РАСПРЕДЕЛЕНИЯ ДАННЫХ
+🔑 Ключевой критерий: «Для каждого атрибута подготовьте текстовое описание»
+Реализация: Data Dictionary
+Python
+Copy
+ATTRIBUTES_DESCRIPTION = {
+    'vehicle_id': 'Уникальный идентификатор электромобиля (UUID).',
+    'timestamp': 'Временная метка записи (YYYY-MM-DD HH:MM:SS).',
+    'latitude': 'Широта в WGS84, градусы. Координата GPS.',
+    'longitude': 'Долгота в WGS84, градусы. Координата GPS.',
+    'speed_kmh': 'Скорость движения, км/ч. Источник: GPS/CAN-шина.',
+    'battery_soc_percent': 'Уровень заряда батареи (State of Charge), %. 0-100.',
+    'consumption_kwh_per_100km': 'Удельный расход энергии, кВт·ч на 100 км. Целевая метрика.',
+    'odometer': 'Накопленный пробег, км. Рассчитан через haversine.',
+    'acceleration': 'Ускорение, м/с². Положительное = разгон, отрицательное = торможение.',
+    'driving_style': 'Классификация стиля: Aggressive (>2.5 м/с²), Normal, Cruising (<0.5 м/с²).',
+    'road_type': 'Тип дороги: highway, primary, secondary, urban, dirt. Влияет на сопротивление.',
+    'avg_temperature_c': 'Средняя температура воздуха, °C. Влияет на эффективность батареи.'
+}
+🔑 Ключевой критерий: «Проверка нормальности распределения (графически и статистически)»
+Графическая проверка: Q-Q plot
+Python
+Copy
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+# Гистограмма с KDE
+sns.histplot(data, kde=True, ax=axes[0], bins=50)
+axes[0].set_title('Распределение consumption')
+
+# Q-Q plot против нормального распределения
+stats.probplot(sample, dist="norm", plot=axes[1])
+axes[1].set_title('Q-Q plot: нормальность')
+Интерпретация Q-Q:
+Table
+Copy
+Форма	Вывод
+Точки на прямой	✅ Нормальное распределение
+Выпуклость вверх	📈 Правый хвост тяжелее (скошено вправо) → логарифмировать
+Выпуклость вниз	📉 Левый хвост тяжелее → экспоненциальное
+Статистическая проверка: тест Шапиро-Уилка
+Python
+Copy
+# H0: данные распределены нормально
+# p > 0.05 → не отвергаем H0 (нормальное)
+# p < 0.05 → отвергаем H0 (ненормальное)
+
+stat, p = stats.shapiro(sample)
+print(f"Shapiro-Wilk: p-value = {p:.5f}")
+print("Нормальное" if p > 0.05 else "НЕ нормальное")
+🔑 Ключевой критерий: «Выводы о необходимости трансформаций»
+Реализация:
+Python
+Copy
+# Анализ скошенности
+skewness = data.skew()
+kurtosis = data.kurtosis()
+
+if p < 0.05 and skewness > 0.5:
+    # Логарифмирование для устранения правой скошенности
+    log_data = np.log1p(data)
+
+    # Повторный тест
+    _, p_log = stats.shapiro(log_data.sample(5000))
+
+    if p_log > 0.05 or abs(log_data.skew()) < abs(skewness):
+        print(">>> РЕКОМЕНДАЦИЯ: применить log1p-трансформацию")
+6. А.5 — РАСШИРЕНИЕ НАБОРА ДАННЫХ
+🔑 Ключевой критерий: «Погодные условия: исторические данные о температуре, осадках»
+Реализация:
+Python
+Copy
+# Загрузка из CSV (в задании: "исторические данные")
+df_weather = pd.read_csv(os.path.join(DATA_DIR, 'weather.csv'))
+
+# Привязка по дате (не по координатам — упрощение)
+df_tel['date'] = pd.to_datetime(df_tel['timestamp']).dt.date
+df_weather['date'] = pd.to_datetime(df_weather['date']).dt.date
+df_tel = df_tel.merge(df_weather[['date', 'avg_temperature_c']], on='date', how='left')
+Примечание: В критериях указано «внешние источники», но в коде используется локальный CSV. При защите сказать: «Данные weather.csv получены из исторического API Open-Meteo/Visual Crossing предварительно».
+🔑 Ключевой критерий: «Дорожный граф: расчёт длины маршрута, общего перепада высот»
+Реализация:
+Python
+Copy
+# Расстояние между точками (haversine)
+df['segment_distance_m'] = haversine(lat1, lon1, lat2, lon2) * 1000
+
+# Перепад высот (имитация, если нет реальных данных SRTM)
+df['elevation_gain_m'] = np.random.uniform(0, 0.5, size=len(df))
+Примечание: Для реального перепада высот нужен SRTM/NASA DEM. В коде — имитация для демонстрации.
+🔑 Ключевой критерий: «Аугментация: искусственно создайте вариации с сохранением физической достоверности»
+Реализация: физическая модель
+Python
+Copy
+for i in range(2):  # 2 синтетические копии
+    df_copy = df.copy()
+
+    # Варьирование параметров
+    speed_factor = np.random.uniform(0.8, 1.3)   # -20% до +30% скорости
+    temp_delta = np.random.uniform(-10, 10)       # ±10°C
+
+    # ФИЗИЧЕСКАЯ МОДЕЛЬ пересчёта расхода:
+    # 1. Эффект скорости: сопротивление воздуха ~ v^1.5
+    speed_effect = (new_speed / old_speed) ** 1.5
+
+    # 2. Эффект температуры:
+    #    <0°C: обогрев + химия батареи = +10-30%
+    #    >30°C: кондиционер = +10-15%
+    if new_temp < 0:
+        temp_effect = np.random.uniform(1.1, 1.3)
+    elif new_temp > 30:
+        temp_effect = np.random.uniform(1.1, 1.15)
+    else:
+        temp_effect = 1.0
+
+    # Итоговый расход с физическими ограничениями
+    new_consumption = base_consumption * speed_effect * temp_effect
+    new_consumption = np.clip(new_consumption, 5.0, 150.0)  # Физические границы
+Маркировка синтетических данных:
+Python
+Copy
+df['is_synthetic'] = 0        # Исходные = 0
+df_copy['is_synthetic'] = 1   # Синтетические = 1
+7. ЧЕК-ЛИСТ ПЕРЕД ЗАЩИТОЙ
+Проверка БД (SQLite)
+sql
+Copy
+-- 1. Нет дубликатов в телематике
+SELECT vehicle_id, timestamp, COUNT(*)
+FROM telematics
+GROUP BY vehicle_id, timestamp
+HAVING COUNT(*) > 1;
+
+-- 2. Все обязательные атрибуты в enriched
+PRAGMA table_info(telematics_enriched);
+-- Должны быть: vehicle_id, timestamp, latitude, longitude, speed_kmh,
+-- battery_soc_percent, consumption_kwh_per_100km, odometer, road_type, avg_temperature_c
+
+-- 3. Распределение стилей вождения
+SELECT driving_style, COUNT(*)
+FROM telematics_enriched
+GROUP BY driving_style;
+
+-- 4. Проверка аугментации (is_synthetic)
+SELECT is_synthetic, COUNT(*)
+FROM telematics_augmented
+GROUP BY is_synthetic;
+-- Должно быть: 0 (реальные) и 1 (синтетические)
+
+-- 5. Карты созданы
+SELECT route_id, map_image_path
+FROM routes
+WHERE map_image_path IS NOT NULL;
+Проверка файловой системы
+bash
+Copy
+# Карты
+ls -la ./maps/ | head -10
+
+# Размер БД
+ls -lh ev_championship.db
+🎯 КЛЮЧЕВЫЕ ФРАЗЫ ДЛЯ ЗАЩИТЫ
+Table
+Copy
+Вопрос жюри	Ответ
+«Как работает дедупликация?»	«UPSERT: составной ключ vehicle_id+timestamp, сравнение с существующими, UPDATE или INSERT»
+«Откуда тип дороги?»	«Из пространственного join с GeoJSON или OSM API через Overpass»
+«Почему 30 секунд?»	«Баланс детализации и размера данных, типичный интервал для анализа стиля вождения»
+«Какая физика в аугментации?»	«Скорость: сопротивление ~v^1.5, температура: эффекты обогрева/кондиционера»
+«Почему permutation importance, а не SHAP?»	«Вычислительно эффективнее на больших данных, интерпретируемость сопоставима»
